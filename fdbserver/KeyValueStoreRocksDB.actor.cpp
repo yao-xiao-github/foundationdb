@@ -53,7 +53,9 @@ std::string getErrorReason(BackgroundErrorReason reason) {
 }
 // Background error handling is tested with Chaos test.
 // TODO: Test background error in simulation. RocksDB doesn't use flow IO in simulation, which limits our ability to
-// inject IO errors. We could implement rocksdb::FileSystem using flow IO to unblock simulation.
+// inject IO errors. We could implement rocksdb::FileSystem using flow IO to unblock simulation. Also, trace event is
+// not available on background threads because trace event requires setting up special thread locals. Using trace event
+// could potentially cause segmentation fault.
 class RocksDBErrorListener : public rocksdb::EventListener {
 public:
 	RocksDBErrorListener(){};
@@ -648,7 +650,7 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 		}
 	}
 
-	Future<Void> getError() override { return errorListener->getFuture();}
+	Future<Void> getError() override { return errorListener->getFuture(); }
 
 	ACTOR static void doClose(RocksDBKeyValueStore* self, bool deleteOnClose) {
 		// The metrics future retains a reference to the DB, so stop it before we delete it.
