@@ -2,7 +2,9 @@
 
 #include <rocksdb/cache.h>
 #include <rocksdb/db.h>
+#include <rocksdb/env.h>
 #include <rocksdb/filter_policy.h>
+#include <rocksdb/functor_wrapper.h>
 #include <rocksdb/listener.h>
 #include <rocksdb/options.h>
 #include <rocksdb/slice_transform.h>
@@ -13,6 +15,7 @@
 #include "flow/flow.h"
 #include "flow/IThreadPool.h"
 #include "flow/ThreadHelper.actor.h"
+#include "fdbrpc/simulator.h"
 
 #include <memory>
 #include <tuple>
@@ -52,6 +55,73 @@ std::string getErrorReason(BackgroundErrorReason reason) {
 		return format("%d Unknown", reason);
 	}
 }
+
+struct ThreadArgs {
+void (*func)(void*);
+void *args;
+ISimulator::ProcessInfo* currentProcess;
+
+ThreadArgs(void (*func)(void*), void* args): func(func), args(args) {
+ASSERT(g_network->isSimulated());
+currentProcess = g_simulator.getCurrentProcess();
+}
+};
+
+void SimulatorStartThread(void *args) {
+	auto* threadArgs = (ThreadArgs*)args;
+	ASSERT(threadArgs->currentProcess);
+	ISimulator::currentProcess = threadArgs->currentProcess;
+	threadArgs->func(threadArgs->args);
+	delete threadArgs;
+}
+
+class RocksDBStartThreadWrapper : public rocksdb::EnvWrapper {
+public:
+explicit RocksDBStartThreadWrapper() :
+	rocksdb::EnvWrapper(rocksdb::Env::Default()) {
+		TraceEvent("CreateWrapper");
+	}
+void Schedule(void (*f)(void* arg), void* a, Priority pri,
+                void* tag = nullptr, void (*u)(void* arg) = nullptr) override {
+	TraceEvent("ScheduleRocksDBabcde");
+	if (!g_network->isSimulated()) { 
+       return target()->Schedule(f, a, pri, tag, u);
+	}
+	TraceEvent("StartSimulationScheduleabcde");
+    ThreadArgs* threadArgs = new ThreadArgs(f, a);
+    return target()->Schedule(&SimulatorStartThread, threadArgs, pri, tag, u);
+}
+/*
+int UnSchedule(void* tag, Priority pri) override {
+    return target_->UnSchedule(tag, pri);
+}*/
+void StartThread(void (*f)(void*), void* a) override {
+	TraceEvent("StartThreadRocksDBabcde");
+	if (!g_network->isSimulated()) { 
+    	return target()->StartThread(f, a);
+	}
+	TraceEvent("StartSimulationThreadabcde");
+    ThreadArgs* threadArgs = new ThreadArgs(f, a);
+	target()->StartThread(&SimulatorStartThread, (void*)threadArgs);
+}
+
+/*
+template <typename FunctionT, typename... Args>
+  void StartThreadTyped(FunctionT function, Args&&... args) {
+	  TraceEvent("TypedThread");
+    using FWType = rocksdb::FunctorWrapper<Args...>;
+    StartThread(
+        [](void* arg) {
+          auto* functor = static_cast<FWType*>(arg);
+          functor->invoke();
+          delete functor;
+        },
+        new FWType(std::function<void(Args...)>(function),
+                   std::forward<Args>(args)...));
+  }*/
+};
+
+
 // Background error handling is tested with Chaos test.
 // TODO: Test background error in simulation. RocksDB doesn't use flow IO in simulation, which limits our ability to
 // inject IO errors. We could implement rocksdb::FileSystem using flow IO to unblock simulation. Also, trace event is
@@ -90,6 +160,12 @@ public:
 			return;
 		errorPromise.send(Never());
 	}
+    
+	// Testing only
+	void OnFlushBegin(rocksdb::DB* db,
+                            const rocksdb::FlushJobInfo& flush_job_info) override {
+		TraceEvent("OnFlushBegin");
+	}
 
 private:
 	ThreadReturnPromise<Void> errorPromise;
@@ -118,6 +194,11 @@ rocksdb::ColumnFamilyOptions getCFOptions() {
 
 rocksdb::Options getOptions() {
 	rocksdb::Options options({}, getCFOptions());
+	if(g_network->isSimulated() ) {
+		TraceEvent("ThreadWrapper");
+		options.env = new RocksDBStartThreadWrapper();
+		// options.env = env.get();
+	}
 	options.avoid_unnecessary_blocking_io = true;
 	options.create_if_missing = true;
 	if (SERVER_KNOBS->ROCKSDB_BACKGROUND_PARALLELISM > 0) {
@@ -292,10 +373,12 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 			ThreadReturnPromise<Void> done;
 			Optional<Future<Void>>& metrics;
 			std::shared_ptr<RocksDBErrorListener> errorListener;
+			rocksdb::Options options;
 			OpenAction(std::string path,
 			           Optional<Future<Void>>& metrics,
-			           std::shared_ptr<RocksDBErrorListener> errorListener)
-			  : path(std::move(path)), metrics(metrics), errorListener(errorListener) {}
+			           std::shared_ptr<RocksDBErrorListener> errorListener, 
+					   rocksdb::Options options)
+			  : path(std::move(path)), metrics(metrics), errorListener(errorListener), options(options) {}
 
 			double getTimeEstimate() const override { return SERVER_KNOBS->COMMIT_TIME_ESTIMATE; }
 		};
@@ -303,9 +386,9 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 			std::vector<rocksdb::ColumnFamilyDescriptor> defaultCF = { rocksdb::ColumnFamilyDescriptor{
 				"default", getCFOptions() } };
 			std::vector<rocksdb::ColumnFamilyHandle*> handle;
-			auto options = getOptions();
-			options.listeners.push_back(a.errorListener);
-			auto status = rocksdb::DB::Open(options, a.path, defaultCF, &handle, &db);
+			// auto options = getOptions();
+			// options.listeners.push_back(a.errorListener);
+			auto status = rocksdb::DB::Open(a.options, a.path, defaultCF, &handle, &db);
 			if (!status.ok()) {
 				logRocksDBError(status, "Open");
 				a.done.sendError(statusToError(status));
@@ -316,7 +399,7 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 				// metric logger in simulation.
 				if (!g_network->isSimulated()) {
 					onMainThread([&] {
-						a.metrics = rocksDBMetricLogger(options.statistics, db);
+						a.metrics = rocksDBMetricLogger(a.options.statistics, db);
 						return Future<bool>(true);
 					}).blockUntilReady();
 				}
@@ -369,8 +452,9 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 		struct CloseAction : TypedAction<Writer, CloseAction> {
 			ThreadReturnPromise<Void> done;
 			std::string path;
+			rocksdb::Options options;
 			bool deleteOnClose;
-			CloseAction(std::string path, bool deleteOnClose) : path(path), deleteOnClose(deleteOnClose) {}
+			CloseAction(std::string path, rocksdb::Options options, bool deleteOnClose) : path(path), deleteOnClose(deleteOnClose), options(options) {}
 			double getTimeEstimate() const override { return SERVER_KNOBS->COMMIT_TIME_ESTIMATE; }
 		};
 		void action(CloseAction& a) {
@@ -385,7 +469,7 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 			if (a.deleteOnClose) {
 				std::vector<rocksdb::ColumnFamilyDescriptor> defaultCF = { rocksdb::ColumnFamilyDescriptor{
 					"default", getCFOptions() } };
-				s = rocksdb::DestroyDB(a.path, getOptions(), defaultCF);
+				s = rocksdb::DestroyDB(a.path, a.options, defaultCF);
 				if (!s.ok()) {
 					logRocksDBError(s, "Destroy");
 				} else {
@@ -621,6 +705,7 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 	Reference<IThreadPool> writeThread;
 	Reference<IThreadPool> readThreads;
 	std::shared_ptr<RocksDBErrorListener> errorListener;
+	rocksdb::Options options;
 	Future<Void> errorFuture;
 	Promise<Void> closePromise;
 	Future<Void> openFuture;
@@ -628,7 +713,7 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 	Optional<Future<Void>> metrics;
 
 	explicit RocksDBKeyValueStore(const std::string& path, UID id)
-	  : path(path), id(id), errorListener(std::make_shared<RocksDBErrorListener>()),
+	  : path(path), id(id), errorListener(std::make_shared<RocksDBErrorListener>()), options(getOptions()),
 	    errorFuture(errorListener->getFuture()) {
 		// In simluation, run the reader/writer threads as Coro threads (i.e. in the network thread. The storage engine
 		// is still multi-threaded as background compaction threads are still present. Reads/writes to disk will also
@@ -660,7 +745,7 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 		self->metrics.reset();
 
 		wait(self->readThreads->stop());
-		auto a = new Writer::CloseAction(self->path, deleteOnClose);
+		auto a = new Writer::CloseAction(self->path, self->options, deleteOnClose);
 		auto f = a->done.getFuture();
 		self->writeThread->post(a);
 		wait(f);
@@ -682,7 +767,7 @@ struct RocksDBKeyValueStore : IKeyValueStore {
 		if (openFuture.isValid()) {
 			return openFuture;
 		}
-		auto a = std::make_unique<Writer::OpenAction>(path, metrics, errorListener);
+		auto a = std::make_unique<Writer::OpenAction>(path, metrics, errorListener, options);
 		openFuture = a->done.getFuture();
 		writeThread->post(a.release());
 		return openFuture;
