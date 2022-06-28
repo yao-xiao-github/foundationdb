@@ -2661,6 +2661,473 @@ TEST_CASE("noSim/ShardedRocksDB/Metadata") {
 	return Void();
 }
 
+// Some convenience functions for debugging to stringify various structures
+// Classes can add compatibility by either specializing toString<T> or implementing
+//   std::string toString() const;
+template <typename T>
+std::string toString(const T& o) {
+	return o.toString();
+}
+
+std::string toString(StringRef s) {
+	return s.printable();
+}
+
+/*
+std::string toString(LogicalPageID id) {
+	if (id == invalidLogicalPageID) {
+		return "LogicalPageID{invalid}";
+	}
+	return format("LogicalPageID{%u}", id);
+}*/
+
+std::string toString(Version v) {
+	if (v == invalidVersion) {
+		return "invalidVersion";
+	}
+	return format("@%" PRId64, v);
+}
+
+std::string toString(bool b) {
+	return b ? "true" : "false";
+}
+
+template <typename T>
+std::string toString(const Standalone<T>& s) {
+	return toString((T)s);
+}
+
+template <typename T>
+std::string toString(const T* begin, const T* end) {
+	std::string r = "{";
+
+	bool comma = false;
+	while (begin != end) {
+		if (comma) {
+			r += ", ";
+		} else {
+			comma = true;
+		}
+		r += toString(*begin++);
+	}
+
+	r += "}";
+	return r;
+}
+
+template <typename T>
+std::string toString(const std::vector<T>& v) {
+	return toString(&v.front(), &v.back() + 1);
+}
+
+template <typename T>
+std::string toString(const VectorRef<T>& v) {
+	return toString(v.begin(), v.end());
+}
+
+template <typename K, typename V>
+std::string toString(const std::map<K, V>& m) {
+	std::string r = "{";
+	bool comma = false;
+	for (const auto& [key, value] : m) {
+		if (comma) {
+			r += ", ";
+		} else {
+			comma = true;
+		}
+		r += toString(value);
+		r += " ";
+		r += toString(key);
+	}
+	r += "}\n";
+	return r;
+}
+
+template <typename K, typename V>
+std::string toString(const std::unordered_map<K, V>& u) {
+	std::string r = "{";
+	bool comma = false;
+	for (const auto& n : u) {
+		if (comma) {
+			r += ", ";
+		} else {
+			comma = true;
+		}
+		r += toString(n.first);
+		r += " => ";
+		r += toString(n.second);
+	}
+	r += "}";
+	return r;
+}
+
+template <typename T>
+std::string toString(const Optional<T>& o) {
+	if (o.present()) {
+		return toString(o.get());
+	}
+	return "<not present>";
+}
+
+template <typename F, typename S>
+std::string toString(const std::pair<F, S>& o) {
+	return format("{%s, %s}", toString(o.first).c_str(), toString(o.second).c_str());
+}
+struct PrefixSegment {
+	int length;
+	int cardinality;
+
+	std::string toString() const { return format("{%d bytes, %d choices}", length, cardinality); }
+};
+
+// Utility class for generating kv pairs under a prefix pattern
+// It currently uses std::string in an abstraction breaking way.
+struct KVSource {
+	KVSource() {}
+
+	typedef VectorRef<uint8_t> PrefixRef;
+	typedef Standalone<PrefixRef> Prefix;
+
+	std::vector<PrefixSegment> desc;
+	std::vector<std::vector<std::string>> segments;
+	std::vector<Prefix> prefixes;
+	std::vector<Prefix*> prefixesSorted;
+	std::string valueData;
+	int prefixLen;
+	int lastIndex;
+	// TODO there is probably a better way to do this
+	Prefix extraRangePrefix;
+
+	KVSource(const std::vector<PrefixSegment>& desc, int numPrefixes = 0) : desc(desc) {
+		if (numPrefixes == 0) {
+			numPrefixes = 1;
+			for (auto& p : desc) {
+				numPrefixes *= p.cardinality;
+			}
+		}
+
+		prefixLen = 0;
+		for (auto& s : desc) {
+			prefixLen += s.length;
+			std::vector<std::string> parts;
+			while (parts.size() < s.cardinality) {
+				parts.push_back(deterministicRandom()->randomAlphaNumeric(s.length));
+			}
+			segments.push_back(std::move(parts));
+		}
+
+		while (prefixes.size() < numPrefixes) {
+			std::string p;
+			for (auto& s : segments) {
+				p.append(s[deterministicRandom()->randomInt(0, s.size())]);
+			}
+			prefixes.push_back(PrefixRef((uint8_t*)p.data(), p.size()));
+		}
+
+		for (auto& p : prefixes) {
+			prefixesSorted.push_back(&p);
+		}
+		std::sort(prefixesSorted.begin(), prefixesSorted.end(), [](const Prefix* a, const Prefix* b) {
+			return KeyRef((uint8_t*)a->begin(), a->size()) < KeyRef((uint8_t*)b->begin(), b->size());
+		});
+
+		valueData = deterministicRandom()->randomAlphaNumeric(100000);
+		lastIndex = 0;
+	}
+
+	// Expands the chosen prefix in the prefix list to hold suffix,
+	// fills suffix with random bytes, and returns a reference to the string
+	KeyRef getKeyRef(int suffixLen) { return makeKey(randomPrefix(), suffixLen); }
+
+	// Like getKeyRef but uses the same prefix as the last randomly chosen prefix
+	KeyRef getAnotherKeyRef(int suffixLen, bool sorted = false) {
+		Prefix& p = sorted ? *prefixesSorted[lastIndex] : prefixes[lastIndex];
+		return makeKey(p, suffixLen);
+	}
+
+	// Like getKeyRef but gets a KeyRangeRef. If samePrefix, it returns a range from the same prefix,
+	// otherwise it returns a random range from the entire keyspace
+	// Can technically return an empty range with low probability
+	KeyRangeRef getKeyRangeRef(bool samePrefix, int suffixLen, bool sorted = false) {
+		KeyRef a, b;
+
+		a = getKeyRef(suffixLen);
+		// Copy a so that b's Prefix Arena allocation doesn't overwrite a if using the same prefix
+		extraRangePrefix.reserve(extraRangePrefix.arena(), a.size());
+		a.copyTo((uint8_t*)extraRangePrefix.begin());
+		a = KeyRef(extraRangePrefix.begin(), a.size());
+
+		if (samePrefix) {
+			b = getAnotherKeyRef(suffixLen, sorted);
+		} else {
+			b = getKeyRef(suffixLen);
+		}
+
+		if (a < b) {
+			return KeyRangeRef(a, b);
+		} else {
+			return KeyRangeRef(b, a);
+		}
+	}
+
+	// TODO unused, remove?
+	// Like getKeyRef but gets a KeyRangeRef for two keys covering the given number of sorted adjacent prefixes
+	KeyRangeRef getRangeRef(int prefixesCovered, int suffixLen) {
+		prefixesCovered = std::min<int>(prefixesCovered, prefixes.size());
+		int i = deterministicRandom()->randomInt(0, prefixesSorted.size() - prefixesCovered);
+		Prefix* begin = prefixesSorted[i];
+		Prefix* end = prefixesSorted[i + prefixesCovered];
+		return KeyRangeRef(makeKey(*begin, suffixLen), makeKey(*end, suffixLen));
+	}
+
+	KeyRef getValue(int len) { return KeyRef(valueData).substr(0, len); }
+
+	// Move lastIndex to the next position, wrapping around to 0
+	void nextPrefix() {
+		++lastIndex;
+		if (lastIndex == prefixes.size()) {
+			lastIndex = 0;
+		}
+	}
+
+	Prefix& randomPrefix() {
+		lastIndex = deterministicRandom()->randomInt(0, prefixes.size());
+		return prefixes[lastIndex];
+	}
+
+	static KeyRef makeKey(Prefix& p, int suffixLen) {
+		p.reserve(p.arena(), p.size() + suffixLen);
+		uint8_t* wptr = p.end();
+		for (int i = 0; i < suffixLen; ++i) {
+			*wptr++ = (uint8_t)deterministicRandom()->randomAlphaNumeric();
+		}
+		return KeyRef(p.begin(), p.size() + suffixLen);
+	}
+
+	int numPrefixes() const { return prefixes.size(); };
+
+	std::string toString() const {
+		return format("{prefixLen=%d prefixes=%d format=%s}", prefixLen, numPrefixes(), ::toString(desc).c_str());
+	}
+};
+
+ACTOR Future<StorageBytes> getStableStorageBytes(IKeyValueStore* kvs) {
+	state StorageBytes sb = kvs->getStorageBytes();
+
+	// Wait for StorageBytes used metric to stabilize
+	loop {
+		wait(kvs->commit());
+		StorageBytes sb2 = kvs->getStorageBytes();
+		bool stable = sb2.used == sb.used;
+		sb = sb2;
+		if (stable) {
+			break;
+		}
+	}
+
+	return sb;
+}
+ACTOR Future<Void> prefixClusteredInsert(IKeyValueStore* kvs,
+                                         int suffixSize,
+                                         int valueSize,
+                                         KVSource source,
+                                         int recordCountTarget,
+                                         bool usePrefixesInOrder,
+                                         bool clearAfter) {
+	state int commitTarget = 5e6;
+
+	state int recordSize = source.prefixLen + suffixSize + valueSize;
+	state int64_t kvBytesTarget = (int64_t)recordCountTarget * recordSize;
+	state int recordsPerPrefix = recordCountTarget / source.numPrefixes();
+
+	fmt::print("\nstoreType: {}\n", static_cast<int>(kvs->getType()));
+	fmt::print("commitTarget: {}\n", commitTarget);
+	fmt::print("prefixSource: {}\n", source.toString());
+	fmt::print("usePrefixesInOrder: {}\n", usePrefixesInOrder);
+	fmt::print("suffixSize: {}\n", suffixSize);
+	fmt::print("valueSize: {}\n", valueSize);
+	fmt::print("recordSize: {}\n", recordSize);
+	fmt::print("recordsPerPrefix: {}\n", recordsPerPrefix);
+	fmt::print("recordCountTarget: {}\n", recordCountTarget);
+	fmt::print("kvBytesTarget: {}\n", kvBytesTarget);
+
+	state int64_t kvBytes = 0;
+	state int64_t kvBytesTotal = 0;
+	state int records = 0;
+	state Future<Void> commit = Void();
+	state std::string value = deterministicRandom()->randomAlphaNumeric(1e6);
+
+	wait(kvs->init());
+
+	state double intervalStart = timer();
+	state double start = intervalStart;
+
+	state std::function<void()> stats = [&]() {
+		double elapsed = timer() - start;
+		printf("Cumulative stats: %.2f seconds  %.2f MB keyValue bytes  %d records  %.2f MB/s  %.2f rec/s\r",
+		       elapsed,
+		       kvBytesTotal / 1e6,
+		       records,
+		       kvBytesTotal / elapsed / 1e6,
+		       records / elapsed);
+		fflush(stdout);
+	};
+
+	while (kvBytesTotal < kvBytesTarget) {
+		wait(yield());
+
+		state int i;
+		for (i = 0; i < recordsPerPrefix; ++i) {
+			KeyValueRef kv(source.getAnotherKeyRef(suffixSize, usePrefixesInOrder), source.getValue(valueSize));
+			kvs->set(kv);
+			kvBytes += kv.expectedSize();
+			++records;
+
+			if (kvBytes >= commitTarget) {
+				wait(commit);
+				stats();
+				commit = kvs->commit();
+				kvBytesTotal += kvBytes;
+				if (kvBytesTotal >= kvBytesTarget) {
+					break;
+				}
+				kvBytes = 0;
+			}
+		}
+
+		// Use every prefix, one at a time
+		source.nextPrefix();
+	}
+
+	wait(commit);
+	// TODO is it desired that not all records are committed? This could commit again to ensure any records set() since
+	// the last commit are persisted. For the purposes of how this is used currently, I don't think it matters though
+	stats();
+	printf("\n");
+
+	intervalStart = timer();
+	StorageBytes sb = wait(getStableStorageBytes(kvs));
+	printf("storageBytes: %s (stable after %.2f seconds)\n", toString(sb).c_str(), timer() - intervalStart);
+
+	if (clearAfter) {
+		printf("Clearing all keys\n");
+		intervalStart = timer();
+		kvs->clear(KeyRangeRef(LiteralStringRef(""), LiteralStringRef("\xff")));
+		state StorageBytes sbClear = wait(getStableStorageBytes(kvs));
+		printf("Cleared all keys in %.2f seconds, final storageByte: %s\n",
+		       timer() - intervalStart,
+		       toString(sbClear).c_str());
+	}
+
+	return Void();
+}
+
+// singlePrefix forces the range read to have the start and end key with the same prefix
+ACTOR Future<Void> randomRangeScans(IKeyValueStore* kvs,
+                                    int suffixSize,
+                                    KVSource source,
+                                    int valueSize,
+                                    int recordCountTarget,
+                                    bool singlePrefix,
+                                    int rowLimit) {
+	fmt::print("\nstoreType: {}\n", static_cast<int>(kvs->getType()));
+	fmt::print("prefixSource: {}\n", source.toString());
+	fmt::print("suffixSize: {}\n", suffixSize);
+	fmt::print("recordCountTarget: {}\n", recordCountTarget);
+	fmt::print("singlePrefix: {}\n", singlePrefix);
+	fmt::print("rowLimit: {}\n", rowLimit);
+
+	state int64_t recordSize = source.prefixLen + suffixSize + valueSize;
+	state int64_t bytesRead = 0;
+	state int64_t recordsRead = 0;
+	state int queries = 0;
+	state int64_t nextPrintRecords = 1e5;
+
+	state double start = timer();
+	state std::function<void()> stats = [&]() {
+		double elapsed = timer() - start;
+		fmt::print("Cumulative stats: {0:.2f} seconds  {1} queries {2:.2f} MB {3} records  {4:.2f} qps {5:.2f} MB/s  "
+		           "{6:.2f} rec/s\r\n",
+		           elapsed,
+		           queries,
+		           bytesRead / 1e6,
+		           recordsRead,
+		           queries / elapsed,
+		           bytesRead / elapsed / 1e6,
+		           recordsRead / elapsed);
+		fflush(stdout);
+	};
+
+	while (recordsRead < recordCountTarget) {
+		KeyRangeRef range = source.getKeyRangeRef(singlePrefix, suffixSize);
+		int rowLim = (deterministicRandom()->randomInt(0, 2) != 0) ? rowLimit : -rowLimit;
+
+		RangeResult result = wait(kvs->readRange(range, rowLim));
+
+		recordsRead += result.size();
+		bytesRead += result.size() * recordSize;
+		++queries;
+
+		// log stats with exponential backoff
+		if (recordsRead >= nextPrintRecords) {
+			stats();
+			nextPrintRecords *= 2;
+		}
+	}
+
+	stats();
+	printf("\n");
+
+	return Void();
+}
+TEST_CASE("noSim/PerfShardedRocksDB/randomRangeScans") {
+	state int prefixLen = 30;
+	state int suffixSize = 12;
+	state int valueSize = 100;
+
+	// TODO change to 100e8 after figuring out no-disk redwood mode
+	state int writeRecordCountTarget = params.getInt("writeRecordCountTarget").orDefault(1e6);
+	state int queryRecordTarget = 1e7;
+	state int writePrefixesInOrder = false;
+	state int minConsecutiveRun = params.getInt("minConsecutiveRun").orDefault(1);
+	state int numPrefix = params.getInt("numPrefix").orDefault(100);
+
+	state KVSource source({ { prefixLen, numPrefix } });
+
+	std::cout << "Num prefixes " << source.prefixes.size();
+
+	state std::string rocksDBTestDir = "sharded-rocksdb-test-db";
+	platform::eraseDirectoryRecursive(rocksDBTestDir);
+
+	wait(delay(5));
+	state IKeyValueStore* kvs =
+	    new ShardedRocksDBKeyValueStore(rocksDBTestDir, deterministicRandom()->randomUniqueID());
+	wait(kvs->init());
+
+	state int i = 0;
+	for (i = 0; i < source.prefixes.size(); ++i) {
+		auto& prefix = source.prefixes[i];
+		KeyRangeRef range = prefixRange(KVSource::makeKey(prefix, 0));
+		wait(kvs->addRange(range, "shard-" + std::to_string(i)));
+	}
+
+	wait(
+	    prefixClusteredInsert(kvs, suffixSize, valueSize, source, writeRecordCountTarget, writePrefixesInOrder, false));
+
+	// divide targets for tiny queries by 10 because they are much slower
+	wait(randomRangeScans(kvs, suffixSize, source, valueSize, queryRecordTarget / 10, true, 10));
+	wait(randomRangeScans(kvs, suffixSize, source, valueSize, queryRecordTarget, true, 1000));
+	wait(randomRangeScans(kvs, suffixSize, source, valueSize, queryRecordTarget / 10, false, 100));
+	wait(randomRangeScans(kvs, suffixSize, source, valueSize, queryRecordTarget, false, 10000));
+	wait(randomRangeScans(kvs, suffixSize, source, valueSize, queryRecordTarget, false, 1000000));
+
+	Future<Void> closed = kvs->onClosed();
+	kvs->dispose();
+	wait(closed);
+
+	return Void();
+}
+
 } // namespace
 
 #endif // SSD_ROCKSDB_EXPERIMENTAL

@@ -1,9 +1,7 @@
-[[test]]
- testTitle = 'UnitTests'
+ testTitle = UnitTests
  useDB = false
  startDelay = 0
 
-     [[test.workload]]
-     testName = 'UnitTests'
+     testName = UnitTests
      maxTestCases = 10
-     testsMatching = 'noSim/ShardedRocksDB/'
+     testsMatching = 'noSim/PerfShardedRocksDB/randomRangeScans'
