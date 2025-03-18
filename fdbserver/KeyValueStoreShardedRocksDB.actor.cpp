@@ -1676,10 +1676,6 @@ public:
 				continue;
 			}
 
-			auto beginSlice = toSlice(range.begin);
-			auto endSlice = toSlice(range.end);
-			db->SuggestCompactRange(it.value()->physicalShard->cf, &beginSlice, &endSlice);
-
 			std::unordered_map<std::string, std::string> options = {
 				{ "level0_file_num_compaction_trigger",
 				  std::to_string(SERVER_KNOBS->SHARDED_ROCKSDB_LEVEL0_FILENUM_COMPACTION_TRIGGER) },
@@ -2331,6 +2327,30 @@ struct ShardedRocksDBKeyValueStore : IKeyValueStore {
 
 		void init() override {}
 		~CompactionWorker() override {}
+
+		struct CompactRangeAction : TypedAction<CompactionWorker, CompactRangeAction> {
+			DataShard* dataShard;
+			KeyRange range;
+			ThreadReturnPromise<Void> done;
+			CompactRangeAction(DataShard* shard, KeyRange range) : dataShard(shard), range(range) {}
+			double getTimeEstimate() const override { return SERVER_KNOBS->COMMIT_TIME_ESTIMATE; }
+		};
+
+		void action(CompactRangeAction& a) {
+			rocksdb::CompactRangeOptions compactOptions;
+			// Force RocksDB to rewrite file to last level.
+			compactOptions.bottommost_level_compaction = rocksdb::BottommostLevelCompaction::kForceOptimized;
+			auto begin = toSlice(a.range.begin);
+			auto end = toSlice(a.range.end);
+			auto startTime = timer_monotonic();
+			auto physicalShard = a.dataShard->physicalShard;
+			physicalShard->db->CompactRange(compactOptions, physicalShard->cf, &begin, &end);
+			auto endTime = timer_monotonic();
+			TraceEvent("CompactionAfterFetchKey", logId)
+			    .detail("ShardId", physicalShard->id)
+			    .detail("Duration", endTime - startTime);
+			a.done.send(Void());
+		}
 
 		struct CompactShardsAction : TypedAction<CompactionWorker, CompactShardsAction> {
 			std::vector<std::shared_ptr<PhysicalShard>> shards;
@@ -3466,6 +3486,21 @@ struct ShardedRocksDBKeyValueStore : IKeyValueStore {
 	}
 
 	void markRangeAsActive(KeyRangeRef range) override { shardManager.markRangeAsActive(range); }
+
+	Future<Void> compactRange(KeyRangeRef range) override {
+		auto shards = shardManager.getDataShardsByRange(range);
+		if (shards.size() != 1) {
+			TraceEvent(SevWarnAlways, "ShardedRocksDBCompactRange")
+			    .detail("NumShards", shards.size())
+			    .detail("Range", range);
+			return Void();
+		}
+
+		auto a = new CompactionWorker::CompactRangeAction(shards[0], range);
+		auto res = a->done.getFuture();
+		compactionThread->post(a);
+		return res;
+	}
 
 	void set(KeyValueRef kv, const Arena*) override {
 		shardManager.put(kv.key, kv.value);

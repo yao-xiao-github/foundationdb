@@ -83,6 +83,9 @@ public:
 	// Marks a key range as active and prepares it for future read.
 	virtual void markRangeAsActive(KeyRangeRef range) {}
 
+	// Marks a key range for compaction and wait for it to be completed.
+	virtual Future<Void> compactRange(KeyRangeRef range) { return Void(); }
+
 	// Persists key range and physical shard mapping.
 	virtual void persistRangeMapping(KeyRangeRef range, bool isAdd) {}
 
